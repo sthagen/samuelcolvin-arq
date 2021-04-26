@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import pickle
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -8,7 +9,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from aioredis import Redis
 
-from .constants import default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
+from .constants import abort_jobs_ss, default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
 from .utils import ms_to_datetime, poll, timestamp_ms
 
 logger = logging.getLogger('arq.jobs')
@@ -50,6 +51,7 @@ class JobResult(JobDef):
     result: Any
     start_time: datetime
     finish_time: datetime
+    queue_name: str
     job_id: Optional[str] = None
 
 
@@ -72,21 +74,30 @@ class Job:
         self._queue_name = _queue_name
         self._deserializer = _deserializer
 
-    async def result(self, timeout: Optional[float] = None, *, pole_delay: float = 0.5) -> Any:
+    async def result(
+        self, timeout: Optional[float] = None, *, poll_delay: float = 0.5, pole_delay: float = None
+    ) -> Any:
         """
         Get the result of the job, including waiting if it's not yet available. If the job raised an exception,
         it will be raised here.
 
         :param timeout: maximum time to wait for the job result before raising ``TimeoutError``, will wait forever
-        :param pole_delay: how often to poll redis for the job result
+        :param poll_delay: how often to poll redis for the job result
+        :param pole_delay: deprecated, use poll_delay instead
         """
-        async for delay in poll(pole_delay):
+        if pole_delay is not None:
+            warnings.warn(
+                '"pole_delay" is deprecated, use the correct spelling "poll_delay" instead', DeprecationWarning
+            )
+            poll_delay = pole_delay
+
+        async for delay in poll(poll_delay):
             info = await self.result_info()
             if info:
                 result = info.result
                 if info.success:
                     return result
-                elif isinstance(result, Exception):
+                elif isinstance(result, (Exception, asyncio.CancelledError)):
                     raise result
                 else:
                     raise SerializationError(result)
@@ -131,6 +142,23 @@ class Job:
                 return JobStatus.not_found
             return JobStatus.deferred if score > timestamp_ms() else JobStatus.queued
 
+    async def abort(self, *, timeout: Optional[float] = None, poll_delay: float = 0.5) -> bool:
+        """
+        Abort the job.
+
+        :param timeout: maximum time to wait for the job result before raising ``TimeoutError``,
+            will wait forever on None
+        :param poll_delay: how often to poll redis for the job result
+        :return: True if the job aborted properly, False otherwise
+        """
+        await self._redis.zadd(abort_jobs_ss, timestamp_ms(), self.job_id)
+        try:
+            await self.result(timeout=timeout, poll_delay=poll_delay)
+        except asyncio.CancelledError:
+            return True
+        else:
+            return False
+
     def __repr__(self) -> str:
         return f'<arq job {self.job_id}>'
 
@@ -172,6 +200,7 @@ def serialize_result(
     start_ms: int,
     finished_ms: int,
     ref: str,
+    queue_name: str,
     *,
     serializer: Optional[Serializer] = None,
 ) -> Optional[bytes]:
@@ -185,6 +214,7 @@ def serialize_result(
         'r': result,
         'st': start_ms,
         'ft': finished_ms,
+        'q': queue_name,
     }
     if serializer is None:
         serializer = pickle.dumps
@@ -247,6 +277,7 @@ def deserialize_result(r: bytes, *, deserializer: Optional[Deserializer] = None)
             result=d['r'],
             start_time=ms_to_datetime(d['st']),
             finish_time=ms_to_datetime(d['ft']),
+            queue_name=d.get('q', '<unknown>'),
         )
     except Exception as e:
         raise DeserializationError('unable to deserialize job result') from e
