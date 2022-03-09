@@ -15,7 +15,7 @@ Job queues and RPC in python with asyncio and redis.
 .. warning::
 
    In ``v0.16`` *arq* was **COMPLETELY REWRITTEN** to use an entirely different approach to registering workers,
-   enqueueing jobs and processing jobs. You will need to either keep using ``v0.15`` or entirely rewrite you *arq*
+   enqueueing jobs and processing jobs. You will need to either keep using ``v0.15`` or entirely rewrite your *arq*
    integration to use ``v0.16``.
 
    See `here <./old/index.html>`_ for old docs.
@@ -135,7 +135,7 @@ Job Uniqueness
 Sometimes you want a job to only be run once at a time (eg. a backup) or once for a given parameter (eg. generating
 invoices for a particular company).
 
-*arq* supports this via custom job ids, see see :func:`arq.connections.ArqRedis.enqueue_job`. It guarantees
+*arq* supports this via custom job ids, see :func:`arq.connections.ArqRedis.enqueue_job`. It guarantees
 that a job with a particular ID cannot be enqueued again until its execution has finished.
 
 .. literalinclude:: examples/job_ids.py
@@ -154,7 +154,7 @@ You can access job information, status and job results using the :class:`arq.job
 Retrying jobs and cancellation
 ..............................
 
-As described above, when an arq work shuts down any going jobs are cancelled immediately
+As described above, when an arq worker shuts down, any ongoing jobs are cancelled immediately
 (via vanilla ``task.cancel()``, so a ``CancelledError`` will be raised). You can see this by running a slow job
 (eg. add ``await asyncio.sleep(5)``) and hitting ``Ctrl+C`` once it's started.
 
