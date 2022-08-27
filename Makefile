@@ -4,9 +4,10 @@ black = black arq tests
 
 .PHONY: install
 install:
-	pip install -U pip setuptools
-	pip install -r requirements.txt
+	pip install -U pip setuptools pre-commit
+	pip install -r requirements/all.txt
 	pip install -e .[watch]
+	pre-commit install
 
 .PHONY: format
 format:
@@ -21,7 +22,7 @@ lint:
 
 .PHONY: test
 test:
-	pytest --cov=arq
+	coverage run -m pytest
 
 .PHONY: testcov
 testcov: test

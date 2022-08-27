@@ -35,6 +35,7 @@ setup(
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
         'Topic :: Internet',
         'Topic :: Software Development :: Libraries :: Python Modules',
         'Topic :: System :: Clustering',
@@ -42,7 +43,7 @@ setup(
         'Topic :: System :: Monitoring',
         'Topic :: System :: Systems Administration',
     ],
-    python_requires='>=3.6',
+    python_requires='>=3.7',
     author='Samuel Colvin',
     author_email='s@muelcolvin.com',
     url='https://github.com/samuelcolvin/arq',
@@ -55,13 +56,11 @@ setup(
         arq=arq.cli:cli
     """,
     install_requires=[
-        'redis>=4.2.0rc2',
-        'click>=6.7',
-        'pydantic>=1',
-        'dataclasses>=0.6;python_version == "3.6"',
-        'typing-extensions>=3.7;python_version < "3.8"'
+        'redis[hiredis]>=4.2.0',
+        'click>=8.0',
+        'typing-extensions>=4.1.0',
     ],
     extras_require={
-        'watch': ['watchgod>=0.4'],
+        'watch': ['watchfiles>=0.16'],
     }
 )

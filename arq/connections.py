@@ -1,34 +1,22 @@
 import asyncio
 import functools
 import logging
-import ssl
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from operator import attrgetter
-from typing import Any, Callable, Generator, List, Optional, Tuple, Union
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
-from pydantic.validators import make_arbitrary_type_validator
 from redis.asyncio import ConnectionPool, Redis
 from redis.asyncio.sentinel import Sentinel
 from redis.exceptions import RedisError, WatchError
 
-from .constants import default_queue_name, job_key_prefix, result_key_prefix
+from .constants import default_queue_name, expires_extra_ms, job_key_prefix, result_key_prefix
 from .jobs import Deserializer, Job, JobDef, JobResult, Serializer, deserialize_job, serialize_job
 from .utils import timestamp_ms, to_ms, to_unix_ms
 
 logger = logging.getLogger('arq.connections')
-
-
-class SSLContext(ssl.SSLContext):
-    """
-    Required to avoid problems with
-    """
-
-    @classmethod
-    def __get_validators__(cls) -> Generator[Callable[..., Any], None, None]:
-        yield make_arbitrary_type_validator(ssl.SSLContext)
 
 
 @dataclass
@@ -41,10 +29,17 @@ class RedisSettings:
 
     host: Union[str, List[Tuple[str, int]]] = 'localhost'
     port: int = 6379
+    unix_socket_path: Optional[str] = None
     database: int = 0
     username: Optional[str] = None
     password: Optional[str] = None
-    ssl: Union[bool, None, SSLContext] = None
+    ssl: bool = False
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_cert_reqs: str = 'required'
+    ssl_ca_certs: Optional[str] = None
+    ssl_ca_data: Optional[str] = None
+    ssl_check_hostname: bool = False
     conn_timeout: int = 1
     conn_retries: int = 5
     conn_retry_delay: int = 1
@@ -55,25 +50,34 @@ class RedisSettings:
     @classmethod
     def from_dsn(cls, dsn: str) -> 'RedisSettings':
         conf = urlparse(dsn)
-        assert conf.scheme in {'redis', 'rediss'}, 'invalid DSN scheme'
+        assert conf.scheme in {'redis', 'rediss', 'unix'}, 'invalid DSN scheme'
+        query_db = parse_qs(conf.query).get('db')
+        if query_db:
+            # e.g. redis://localhost:6379?db=1
+            database = int(query_db[0])
+        else:
+            database = int(conf.path.lstrip('/')) if conf.path else 0
         return RedisSettings(
             host=conf.hostname or 'localhost',
             port=conf.port or 6379,
             ssl=conf.scheme == 'rediss',
             username=conf.username,
             password=conf.password,
-            database=int((conf.path or '0').strip('/')),
+            database=database,
+            unix_socket_path=conf.path if conf.scheme == 'unix' else None,
         )
 
     def __repr__(self) -> str:
         return 'RedisSettings({})'.format(', '.join(f'{k}={v!r}' for k, v in self.__dict__.items()))
 
 
-# extra time after the job is expected to start when the job key should expire, 1 day in ms
-expires_extra_ms = 86_400_000
+if TYPE_CHECKING:
+    BaseRedis = Redis[bytes]
+else:
+    BaseRedis = Redis
 
 
-class ArqRedis(Redis):  # type: ignore[misc]
+class ArqRedis(BaseRedis):
     """
     Thin subclass of ``redis.asyncio.Redis`` which adds :func:`arq.connections.enqueue_job`.
 
@@ -81,6 +85,8 @@ class ArqRedis(Redis):  # type: ignore[misc]
     :param job_serializer: a function that serializes Python objects to bytes, defaults to pickle.dumps
     :param job_deserializer: a function that deserializes bytes into Python objects, defaults to pickle.loads
     :param default_queue_name: the default queue name to use, defaults to ``arq.queue``.
+    :param expires_extra_ms: the default length of time from when a job is expected to start
+     after which the job expires, defaults to 1 day in ms.
     :param kwargs: keyword arguments directly passed to ``redis.asyncio.Redis``.
     """
 
@@ -90,6 +96,7 @@ class ArqRedis(Redis):  # type: ignore[misc]
         job_serializer: Optional[Serializer] = None,
         job_deserializer: Optional[Deserializer] = None,
         default_queue_name: str = default_queue_name,
+        expires_extra_ms: int = expires_extra_ms,
         **kwargs: Any,
     ) -> None:
         self.job_serializer = job_serializer
@@ -97,6 +104,7 @@ class ArqRedis(Redis):  # type: ignore[misc]
         self.default_queue_name = default_queue_name
         if pool_or_conn:
             kwargs['connection_pool'] = pool_or_conn
+        self.expires_extra_ms = expires_extra_ms
         super().__init__(**kwargs)
 
     async def enqueue_job(
@@ -120,7 +128,8 @@ class ArqRedis(Redis):  # type: ignore[misc]
         :param _queue_name: queue of the job, can be used to create job in different queue
         :param _defer_until: datetime at which to run the job
         :param _defer_by: duration to wait before running the job
-        :param _expires: if the job still hasn't started after this duration, do not run it
+        :param _expires: do not start or retry a job after this duration;
+            defaults to 24 hours plus deferring time, if any
         :param _job_try: useful when re-enqueueing jobs within a job
         :param kwargs: any keyword arguments to pass to the function
         :return: :class:`arq.jobs.Job` instance or ``None`` if a job with this ID already exists
@@ -148,12 +157,12 @@ class ArqRedis(Redis):  # type: ignore[misc]
             else:
                 score = enqueue_time_ms
 
-            expires_ms = expires_ms or score - enqueue_time_ms + expires_extra_ms
+            expires_ms = expires_ms or score - enqueue_time_ms + self.expires_extra_ms
 
             job = serialize_job(function, args, kwargs, _job_try, enqueue_time_ms, serializer=self.job_serializer)
             pipe.multi()
-            pipe.psetex(job_key, expires_ms, job)
-            pipe.zadd(_queue_name, {job_id: score})
+            pipe.psetex(job_key, expires_ms, job)  # type: ignore[no-untyped-call]
+            pipe.zadd(_queue_name, {job_id: score})  # type: ignore[unused-coroutine]
             try:
                 await pipe.execute()
             except WatchError:
@@ -179,7 +188,9 @@ class ArqRedis(Redis):  # type: ignore[misc]
         return sorted(results, key=attrgetter('enqueue_time'))
 
     async def _get_job_def(self, job_id: bytes, score: int) -> JobDef:
-        v = await self.get(job_key_prefix + job_id.decode())
+        key = job_key_prefix + job_id.decode()
+        v = await self.get(key)
+        assert v is not None, f'job "{key}" not found'
         jd = deserialize_job(v, deserializer=self.job_deserializer)
         jd.score = score
         return jd
@@ -199,6 +210,7 @@ async def create_pool(
     job_serializer: Optional[Serializer] = None,
     job_deserializer: Optional[Deserializer] = None,
     default_queue_name: str = default_queue_name,
+    expires_extra_ms: int = expires_extra_ms,
 ) -> ArqRedis:
     """
     Create a new redis pool, retrying up to ``conn_retries`` times if the connection fails.
@@ -214,7 +226,12 @@ async def create_pool(
     if settings.sentinel:
 
         def pool_factory(*args: Any, **kwargs: Any) -> ArqRedis:
-            client = Sentinel(*args, sentinels=settings.host, ssl=settings.ssl, **kwargs)
+            client = Sentinel(  # type: ignore[misc]
+                *args,
+                sentinels=settings.host,
+                ssl=settings.ssl,
+                **kwargs,
+            )
             return client.master_for(settings.sentinel_master, redis_class=ArqRedis)
 
     else:
@@ -222,54 +239,54 @@ async def create_pool(
             ArqRedis,
             host=settings.host,
             port=settings.port,
+            unix_socket_path=settings.unix_socket_path,
             socket_connect_timeout=settings.conn_timeout,
             ssl=settings.ssl,
+            ssl_keyfile=settings.ssl_keyfile,
+            ssl_certfile=settings.ssl_certfile,
+            ssl_cert_reqs=settings.ssl_cert_reqs,
+            ssl_ca_certs=settings.ssl_ca_certs,
+            ssl_ca_data=settings.ssl_ca_data,
+            ssl_check_hostname=settings.ssl_check_hostname,
         )
 
-    try:
-        pool = pool_factory(
-            db=settings.database, username=settings.username, password=settings.password, encoding='utf8'
-        )
-        pool.job_serializer = job_serializer
-        pool.job_deserializer = job_deserializer
-        pool.default_queue_name = default_queue_name
-        await pool.ping()
-
-    except (ConnectionError, OSError, RedisError, asyncio.TimeoutError) as e:
-        if retry < settings.conn_retries:
-            logger.warning(
-                'redis connection error %s:%s %s %s, %d retries remaining...',
-                settings.host,
-                settings.port,
-                e.__class__.__name__,
-                e,
-                settings.conn_retries - retry,
+    while True:
+        try:
+            pool = pool_factory(
+                db=settings.database, username=settings.username, password=settings.password, encoding='utf8'
             )
-            await asyncio.sleep(settings.conn_retry_delay)
+            pool.job_serializer = job_serializer
+            pool.job_deserializer = job_deserializer
+            pool.default_queue_name = default_queue_name
+            pool.expires_extra_ms = expires_extra_ms
+            await pool.ping()
+
+        except (ConnectionError, OSError, RedisError, asyncio.TimeoutError) as e:
+            if retry < settings.conn_retries:
+                logger.warning(
+                    'redis connection error %s:%s %s %s, %d retries remaining...',
+                    settings.host,
+                    settings.port,
+                    e.__class__.__name__,
+                    e,
+                    settings.conn_retries - retry,
+                )
+                await asyncio.sleep(settings.conn_retry_delay)
+                retry = retry + 1
+            else:
+                raise
         else:
-            raise
-    else:
-        if retry > 0:
-            logger.info('redis connection successful')
-        return pool
-
-    # recursively attempt to create the pool outside the except block to avoid
-    # "During handling of the above exception..." madness
-    return await create_pool(
-        settings,
-        retry=retry + 1,
-        job_serializer=job_serializer,
-        job_deserializer=job_deserializer,
-        default_queue_name=default_queue_name,
-    )
+            if retry > 0:
+                logger.info('redis connection successful')
+            return pool
 
 
-async def log_redis_info(redis: Redis, log_func: Callable[[str], Any]) -> None:
+async def log_redis_info(redis: 'Redis[bytes]', log_func: Callable[[str], Any]) -> None:
     async with redis.pipeline(transaction=True) as pipe:
-        pipe.info(section='Server')
-        pipe.info(section='Memory')
-        pipe.info(section='Clients')
-        pipe.dbsize()
+        pipe.info(section='Server')  # type: ignore[unused-coroutine]
+        pipe.info(section='Memory')  # type: ignore[unused-coroutine]
+        pipe.info(section='Clients')  # type: ignore[unused-coroutine]
+        pipe.dbsize()  # type: ignore[unused-coroutine]
         info_server, info_memory, info_clients, key_count = await pipe.execute()
 
     redis_version = info_server.get('redis_version', '?')
