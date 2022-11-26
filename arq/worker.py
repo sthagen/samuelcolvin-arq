@@ -3,7 +3,7 @@ import inspect
 import logging
 import signal
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from signal import Signals
 from time import time
@@ -170,6 +170,10 @@ class Worker:
     :param job_deserializer: a function that deserializes bytes into Python objects, defaults to pickle.loads
     :param expires_extra_ms: the default length of time from when a job is expected to start
      after which the job expires, defaults to 1 day in ms.
+    :param timezone: timezone used for evaluation of cron schedules,
+        defaults to system timezone
+    :param log_results: when set to true (default) results for successful jobs
+      will be logged
     """
 
     def __init__(
@@ -202,6 +206,8 @@ class Worker:
         job_serializer: Optional[Serializer] = None,
         job_deserializer: Optional[Deserializer] = None,
         expires_extra_ms: int = expires_extra_ms,
+        timezone: Optional[timezone] = None,
+        log_results: bool = True,
     ):
         self.functions: Dict[str, Union[Function, CronJob]] = {f.name: f for f in map(func, functions)}
         if queue_name is None:
@@ -266,6 +272,10 @@ class Worker:
         self.job_serializer = job_serializer
         self.job_deserializer = job_deserializer
         self.expires_extra_ms = expires_extra_ms
+        self.log_results = log_results
+
+        # default to system timezone
+        self.timezone = datetime.now().astimezone().tzinfo if timezone is None else timezone
 
     def run(self) -> None:
         """
@@ -553,7 +563,7 @@ class Worker:
                     exc_extra = exc_extra()
                 raise
             else:
-                result_str = '' if result is None else truncate(repr(result))
+                result_str = '' if result is None or not self.log_results else truncate(repr(result))
             finally:
                 del self.job_tasks[job_id]
 
@@ -673,7 +683,7 @@ class Worker:
             await tr.execute()
 
     async def heart_beat(self) -> None:
-        now = datetime.now()
+        now = datetime.now(tz=self.timezone)
         await self.record_health()
 
         cron_window_size = max(self.poll_delay_s, 0.5)  # Clamp the cron delay to 0.5
