@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import inspect
 import logging
 import signal
@@ -150,8 +151,13 @@ class Worker:
     :param on_shutdown: coroutine function to run at shutdown
     :param on_job_start: coroutine function to run on job start
     :param on_job_end: coroutine function to run on job end
+    :param after_job_end: coroutine function to run after job has ended and results have been recorded
     :param handle_signals: default true, register signal handlers,
       set to false when running inside other async framework
+    :param job_completion_wait: time to wait before cancelling tasks after a signal.
+      Useful together with ``terminationGracePeriodSeconds`` in kubernetes,
+      when you want to make the pod complete jobs before shutting down.
+      The worker will not pick new tasks while waiting for shut down.
     :param max_jobs: maximum number of jobs to run at a time
     :param job_timeout: default job timeout (max run time)
     :param keep_result: default duration to keep job results for
@@ -189,7 +195,9 @@ class Worker:
         on_shutdown: Optional['StartupShutdown'] = None,
         on_job_start: Optional['StartupShutdown'] = None,
         on_job_end: Optional['StartupShutdown'] = None,
+        after_job_end: Optional['StartupShutdown'] = None,
         handle_signals: bool = True,
+        job_completion_wait: int = 0,
         max_jobs: int = 10,
         job_timeout: 'SecondsTimedelta' = 300,
         keep_result: 'SecondsTimedelta' = 3600,
@@ -227,6 +235,7 @@ class Worker:
         self.on_shutdown = on_shutdown
         self.on_job_start = on_job_start
         self.on_job_end = on_job_end
+        self.after_job_end = after_job_end
         self.sem = asyncio.BoundedSemaphore(max_jobs)
         self.job_timeout_s = to_seconds(job_timeout)
         self.keep_result_s = to_seconds(keep_result)
@@ -260,13 +269,19 @@ class Worker:
         self._last_health_check: float = 0
         self._last_health_check_log: Optional[str] = None
         self._handle_signals = handle_signals
+        self._job_completion_wait = job_completion_wait
         if self._handle_signals:
-            self._add_signal_handler(signal.SIGINT, self.handle_sig)
-            self._add_signal_handler(signal.SIGTERM, self.handle_sig)
+            if self._job_completion_wait:
+                self._add_signal_handler(signal.SIGINT, self.handle_sig_wait_for_completion)
+                self._add_signal_handler(signal.SIGTERM, self.handle_sig_wait_for_completion)
+            else:
+                self._add_signal_handler(signal.SIGINT, self.handle_sig)
+                self._add_signal_handler(signal.SIGTERM, self.handle_sig)
         self.on_stop: Optional[Callable[[Signals], None]] = None
         # whether or not to retry jobs on Retry and CancelledError
         self.retry_jobs = retry_jobs
         self.allow_abort_jobs = allow_abort_jobs
+        self.allow_pick_jobs: bool = True
         self.aborting_tasks: Set[str] = set()
         self.max_burst_jobs = max_burst_jobs
         self.job_serializer = job_serializer
@@ -358,23 +373,23 @@ class Worker:
             if burst_jobs_remaining < 1:
                 return
             count = min(burst_jobs_remaining, count)
+        if self.allow_pick_jobs:
+            async with self.sem:  # don't bother with zrangebyscore until we have "space" to run the jobs
+                now = timestamp_ms()
+                job_ids = await self.pool.zrangebyscore(
+                    self.queue_name, min=float('-inf'), start=self._queue_read_offset, num=count, max=now
+                )
 
-        async with self.sem:  # don't bother with zrangebyscore until we have "space" to run the jobs
-            now = timestamp_ms()
-            job_ids = await self.pool.zrangebyscore(
-                self.queue_name, min=float('-inf'), start=self._queue_read_offset, num=count, max=now
-            )
+            await self.start_jobs(job_ids)
 
-        await self.start_jobs(job_ids)
+            if self.allow_abort_jobs:
+                await self._cancel_aborted_jobs()
 
-        if self.allow_abort_jobs:
-            await self._cancel_aborted_jobs()
-
-        for job_id, t in list(self.tasks.items()):
-            if t.done():
-                del self.tasks[job_id]
-                # required to make sure errors in run_job get propagated
-                t.result()
+            for job_id, t in list(self.tasks.items()):
+                if t.done():
+                    del self.tasks[job_id]
+                    # required to make sure errors in run_job get propagated
+                    t.result()
 
         await self.heart_beat()
 
@@ -635,6 +650,9 @@ class Worker:
             )
         )
 
+        if self.after_job_end:
+            await self.after_job_end(ctx)
+
     async def finish_job(
         self,
         job_id: str,
@@ -750,6 +768,55 @@ class Worker:
 
     def _jobs_started(self) -> int:
         return self.jobs_complete + self.jobs_retried + self.jobs_failed + len(self.tasks)
+
+    async def _sleep_until_tasks_complete(self) -> None:
+        """
+        Sleeps until all tasks are done. Used together with asyncio.wait_for()
+        """
+        while len(self.tasks):
+            await asyncio.sleep(0.1)
+
+    async def _wait_for_tasks_to_complete(self, signum: Signals) -> None:
+        """
+        Wait for tasks to complete, until `wait_for_job_completion_on_signal_second` has been reached.
+        """
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self._sleep_until_tasks_complete(),
+                self._job_completion_wait,
+            )
+        logger.info(
+            'shutdown on %s, wait complete ◆ %d jobs complete ◆ %d failed ◆ %d retries ◆ %d ongoing to cancel',
+            signum.name,
+            self.jobs_complete,
+            self.jobs_failed,
+            self.jobs_retried,
+            sum(not t.done() for t in self.tasks.values()),
+        )
+        for t in self.tasks.values():
+            if not t.done():
+                t.cancel()
+        self.main_task and self.main_task.cancel()
+        self.on_stop and self.on_stop(signum)
+
+    def handle_sig_wait_for_completion(self, signum: Signals) -> None:
+        """
+        Alternative signal handler that allow tasks to complete within a given time before shutting down the worker.
+        Time can be configured using `wait_for_job_completion_on_signal_second`.
+        The worker will stop picking jobs when signal has been received.
+        """
+        sig = Signals(signum)
+        logger.info('Setting allow_pick_jobs to `False`')
+        self.allow_pick_jobs = False
+        logger.info(
+            'shutdown on %s ◆ %d jobs complete ◆ %d failed ◆ %d retries ◆ %d to be completed',
+            sig.name,
+            self.jobs_complete,
+            self.jobs_failed,
+            self.jobs_retried,
+            len(self.tasks),
+        )
+        self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
 
     def handle_sig(self, signum: Signals) -> None:
         sig = Signals(signum)

@@ -110,6 +110,34 @@ async def test_handle_no_sig(caplog):
     assert worker.tasks[1].cancel.call_count == 1
 
 
+async def test_worker_signal_completes_job_before_shutting_down(caplog, arq_redis: ArqRedis, worker):
+    caplog.set_level(logging.INFO)
+
+    async def sleep_job(ctx, time):
+        await asyncio.sleep(time)
+
+    await arq_redis.enqueue_job('sleep_job', 0.2, _job_id='short_sleep')  # should be cancelled
+    await arq_redis.enqueue_job('sleep_job', 5, _job_id='long_sleep')  # should be cancelled
+    worker = worker(
+        functions=[func(sleep_job, name='sleep_job', max_tries=1)],
+        job_completion_wait=0.4,
+        job_timeout=10,
+    )
+    assert worker.jobs_complete == 0
+    asyncio.create_task(worker.main())
+    await asyncio.sleep(0.1)
+    worker.handle_sig_wait_for_completion(signal.SIGINT)
+    assert worker.allow_pick_jobs is False
+    await asyncio.sleep(0.5)
+    logs = [rec.message for rec in caplog.records]
+    assert 'shutdown on SIGINT ◆ 0 jobs complete ◆ 0 failed ◆ 0 retries ◆ 2 to be completed' in logs
+    assert 'shutdown on SIGINT, wait complete ◆ 1 jobs complete ◆ 0 failed ◆ 0 retries ◆ 1 ongoing to cancel' in logs
+    assert 'long_sleep:sleep_job cancelled, will be run again' in logs[-1]
+    assert worker.jobs_complete == 1
+    assert worker.jobs_retried == 1
+    assert worker.jobs_failed == 0
+
+
 async def test_job_successful(arq_redis: ArqRedis, worker, caplog):
     caplog.set_level(logging.INFO)
     await arq_redis.enqueue_job('foobar', _job_id='testing')
@@ -810,6 +838,11 @@ async def test_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
     assert worker.job_tasks == {}
 
 
+async def test_abort_job_which_is_not_in_queue(arq_redis: ArqRedis):
+    job = Job(job_id='testing', redis=arq_redis)
+    assert await job.abort() is False
+
+
 async def test_abort_job_before(arq_redis: ArqRedis, worker, caplog, loop):
     async def longfunc(ctx):
         await asyncio.sleep(3600)
@@ -920,6 +953,10 @@ async def test_on_job(arq_redis: ArqRedis, worker):
         assert ctx['job_id'] == 'testing'
         result['called'] += 1
 
+    async def after_end(ctx):
+        assert ctx['job_id'] == 'testing'
+        result['called'] += 2
+
     async def test(ctx):
         return
 
@@ -928,6 +965,7 @@ async def test_on_job(arq_redis: ArqRedis, worker):
         functions=[func(test, name='func')],
         on_job_start=on_start,
         on_job_end=on_end,
+        after_job_end=after_end,
         job_timeout=0.2,
         poll_delay=0.1,
     )
@@ -939,7 +977,7 @@ async def test_on_job(arq_redis: ArqRedis, worker):
     assert worker.jobs_complete == 1
     assert worker.jobs_failed == 0
     assert worker.jobs_retried == 0
-    assert result['called'] == 2
+    assert result['called'] == 4
 
 
 async def test_worker_timezone_defaults_to_system_timezone(worker):

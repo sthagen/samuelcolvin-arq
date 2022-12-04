@@ -18,6 +18,10 @@ Serializer = Callable[[Dict[str, Any]], bytes]
 Deserializer = Callable[[bytes], Dict[str, Any]]
 
 
+class ResultNotFound(RuntimeError):
+    pass
+
+
 class JobStatus(str, Enum):
     """
     Enum of job statuses.
@@ -82,8 +86,10 @@ class Job:
         self, timeout: Optional[float] = None, *, poll_delay: float = 0.5, pole_delay: float = None
     ) -> Any:
         """
-        Get the result of the job, including waiting if it's not yet available. If the job raised an exception,
-        it will be raised here.
+        Get the result of the job or, if the job raised an exception, reraise it.
+
+        This function waits for the result if it's not yet available and the job is
+        present in the queue. Otherwise ``ResultNotFound`` is raised.
 
         :param timeout: maximum time to wait for the job result before raising ``TimeoutError``, will wait forever
         :param poll_delay: how often to poll redis for the job result
@@ -96,15 +102,24 @@ class Job:
             poll_delay = pole_delay
 
         async for delay in poll(poll_delay):
-            info = await self.result_info()
-            if info:
-                result = info.result
+            async with self._redis.pipeline(transaction=True):
+                v = await self._redis.get(result_key_prefix + self.job_id)
+                s = await self._redis.zscore(self._queue_name, self.job_id)
+
+            if v:
+                info = deserialize_result(v, deserializer=self._deserializer)
                 if info.success:
-                    return result
-                elif isinstance(result, (Exception, asyncio.CancelledError)):
-                    raise result
+                    return info.result
+                elif isinstance(info.result, (Exception, asyncio.CancelledError)):
+                    raise info.result
                 else:
-                    raise SerializationError(result)
+                    raise SerializationError(info.result)
+            elif s is None:
+                raise ResultNotFound(
+                    'Not waiting for job result because the job is not in queue. '
+                    'Is the worker function configured to keep result?'
+                )
+
             if timeout is not None and delay > timeout:
                 raise asyncio.TimeoutError()
 
@@ -137,15 +152,20 @@ class Job:
         """
         Status of the job.
         """
-        if await self._redis.exists(result_key_prefix + self.job_id):
+        async with self._redis.pipeline(transaction=True) as tr:
+            tr.exists(result_key_prefix + self.job_id)  # type: ignore[unused-coroutine]
+            tr.exists(in_progress_key_prefix + self.job_id)  # type: ignore[unused-coroutine]
+            tr.zscore(self._queue_name, self.job_id)  # type: ignore[unused-coroutine]
+            is_complete, is_in_progress, score = await tr.execute()
+
+        if is_complete:
             return JobStatus.complete
-        elif await self._redis.exists(in_progress_key_prefix + self.job_id):
+        elif is_in_progress:
             return JobStatus.in_progress
-        else:
-            score = await self._redis.zscore(self._queue_name, self.job_id)
-            if not score:
-                return JobStatus.not_found
+        elif score:
             return JobStatus.deferred if score > timestamp_ms() else JobStatus.queued
+        else:
+            return JobStatus.not_found
 
     async def abort(self, *, timeout: Optional[float] = None, poll_delay: float = 0.5) -> bool:
         """
@@ -169,6 +189,9 @@ class Job:
             await self.result(timeout=timeout, poll_delay=poll_delay)
         except asyncio.CancelledError:
             return True
+        except ResultNotFound:
+            # We do not know if the job was cancelled or not
+            return False
         else:
             return False
 
