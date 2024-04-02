@@ -44,6 +44,7 @@ class RedisSettings:
     conn_timeout: int = 1
     conn_retries: int = 5
     conn_retry_delay: int = 1
+    max_connections: Optional[int] = None
 
     sentinel: bool = False
     sentinel_master: str = 'mymaster'
@@ -61,8 +62,10 @@ class RedisSettings:
         if query_db:
             # e.g. redis://localhost:6379?db=1
             database = int(query_db[0])
-        else:
+        elif conf.scheme != 'unix':
             database = int(conf.path.lstrip('/')) if conf.path else 0
+        else:
+            database = 0
         return RedisSettings(
             host=conf.hostname or 'localhost',
             port=conf.port or 6379,
@@ -262,6 +265,7 @@ async def create_pool(
             retry=settings.retry,
             retry_on_timeout=settings.retry_on_timeout,
             retry_on_error=settings.retry_on_error,
+            max_connections=settings.max_connections,
         )
 
     while True:
@@ -278,7 +282,7 @@ async def create_pool(
         except (ConnectionError, OSError, RedisError, asyncio.TimeoutError) as e:
             if retry < settings.conn_retries:
                 logger.warning(
-                    'redis connection error %s:%s %s %s, %d retries remaining...',
+                    'redis connection error %s:%s %s %s, %s retries remaining...',
                     settings.host,
                     settings.port,
                     e.__class__.__name__,
