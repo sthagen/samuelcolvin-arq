@@ -7,6 +7,8 @@
 [![versions](https://img.shields.io/pypi/pyversions/arq.svg)](https://github.com/samuelcolvin/arq)
 [![license](https://img.shields.io/github/license/samuelcolvin/arq.svg)](https://github.com/samuelcolvin/arq/blob/main/LICENSE)
 
+**In maintenance only mode**: arq is in maintenance only mode, see [#510](https://github.com/python-arq/arq/issues/510).
+
 Job queues in python with asyncio and redis.
 
 See [documentation](https://arq-docs.helpmanual.io/) for more details.
