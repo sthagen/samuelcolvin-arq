@@ -2,7 +2,7 @@ import asyncio
 import functools
 import os
 import sys
-from typing import Generator
+from collections.abc import Generator
 
 import msgpack
 import pytest
@@ -38,7 +38,7 @@ def test_redis_host(redis_container: RedisContainer) -> str:
 
 @pytest.fixture(scope='session')
 def test_redis_port(redis_container: RedisContainer) -> int:
-    return redis_container.get_exposed_port(redis_container.port_to_expose)
+    return redis_container.get_exposed_port(redis_container.port)
 
 
 @pytest.fixture(scope='session')
